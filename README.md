@@ -9,6 +9,11 @@ A simple headless macOS VM client for Apple Silicon, supporting **hardware video
 swiftc -O -framework Virtualization -framework AppKit avm.swift -o avm
 codesign --force --sign - --entitlements avm.entitlements avm
 
+# For hardware video encoding: relax SIP (one-time, from Recovery)
+# and register an AMFI exemption. See "Hardware Video Encoding" below.
+# csrutil enable --without debug
+# brew install retX0/tap/amfree && sudo amfree --path /path/to/avm/
+
 # Create a VM (downloads the latest macOS IPSW automatically)
 ./avm install latest ~/VMs/dev.vbvm --cpus 6 --memory 8 --disk 128
 
