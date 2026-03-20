@@ -93,7 +93,7 @@ This requires additional setup:
 csrutil enable --without debug
 ```
 
-This keeps SIP fully enabled except for the debug restriction, which allows AMFI policy exemptions for ad-hoc signed binaries.
+This keeps SIP fully enabled except for the debug restriction, which allows AMFI policy exemptions for binaries with restricted (Apple-private) entitlements.
 
 ### 2. Install amfree
 
