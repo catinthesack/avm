@@ -1,5 +1,7 @@
 import Cocoa
 import Virtualization
+import IOKit
+import IOKit.usb
 
 // MARK: - Helpers
 
@@ -66,6 +68,9 @@ struct VMConfig {
     var mac        = ""
     var noAudio    = false
     var noAccel    = false
+    var noFairPlay = false
+    var network    = "nat"         // "nat" or "bridge[=<interface>]"
+    var usbDevices: [String] = []  // vendor:product hex pairs, e.g. "05ac:12ab"
 
     var memorySize: UInt64 { UInt64(memoryGB) * GB }
 
@@ -88,6 +93,8 @@ struct VMConfig {
         if let v = j["macAddress"]    as? String { c.mac      = v }
         if let v = j["noAudio"]       as? Bool   { c.noAudio  = v }
         if let v = j["noAccel"]       as? Bool   { c.noAccel  = v }
+        if let v = j["noFairPlay"]    as? Bool   { c.noFairPlay = v }
+        if let v = j["network"]       as? String { c.network   = v }
         return c
     }
 
@@ -115,11 +122,184 @@ struct VMConfig {
         if !mac.isEmpty { d["macAddress"] = mac }
         if noAudio { d["noAudio"] = true }
         if noAccel { d["noAccel"] = true }
+        if noFairPlay { d["noFairPlay"] = true }
+        if network != "nat" { d["network"] = network }
         try JSONSerialization.data(withJSONObject: d, options: [.prettyPrinted, .sortedKeys]).write(to: url)
     }
 }
 
 // MARK: - Build VZVirtualMachineConfiguration
+
+func setPlatformBool(_ obj: NSObject, setter: String, value: Bool) {
+    let sel = NSSelectorFromString(setter)
+    guard obj.responds(to: sel) else { return }
+    typealias SetBool = @convention(c) (AnyObject, Selector, Bool) -> Void
+    unsafeBitCast(obj.method(for: sel), to: SetBool.self)(obj, sel, value)
+}
+
+func setPlatformU64(_ obj: NSObject, setter: String, value: UInt64) {
+    let sel = NSSelectorFromString(setter)
+    guard obj.responds(to: sel) else { return }
+    typealias SetU64 = @convention(c) (AnyObject, Selector, UInt64) -> Void
+    unsafeBitCast(obj.method(for: sel), to: SetU64.self)(obj, sel, value)
+}
+
+func enableFairPlay(_ platform: VZMacPlatformConfiguration) {
+    // FairPlay: works via KVC
+    if (platform as NSObject).responds(to: NSSelectorFromString("_isFairPlayEnabled")) {
+        platform.setValue(true, forKey: "_fairPlayEnabled")
+        log("  FairPlay: enabled")
+    }
+
+    // Strong Identity
+    setPlatformBool(platform, setter: "_setStrongIdentityEnabled:", value: true)
+    log("  StrongIdentity: enabled")
+
+    // Disable fake encryption (enable real encryption for attestation)
+    setPlatformBool(platform, setter: "_setFakeEncryptionEnabled:", value: false)
+    log("  FakeEncryption: disabled")
+
+    // SIO Descrambler
+    setPlatformBool(platform, setter: "_setSIODescramblerEnabled:", value: true)
+    log("  SIODescrambler: enabled")
+
+    // Host attribute share options (share all attributes)
+    setPlatformU64(platform, setter: "_setHostAttributeShareOptions:", value: 0xFF)
+    log("  HostAttributeShareOptions: 0xFF")
+}
+
+func attachBiometricDevice(_ vz: VZVirtualMachineConfiguration) {
+    if let cls = NSClassFromString("_VZMacTouchIDDeviceConfiguration") as? NSObject.Type {
+        let device = cls.init()
+        vz.setValue([device], forKey: "_biometricDevices")
+        log("  Biometric: TouchID")
+    }
+}
+
+// MARK: - USB Passthrough
+
+/// Parse "05ac:12ab" into (vendorID, productID)
+func parseUSBID(_ s: String) -> (Int, Int)? {
+    let parts = s.split(separator: ":")
+    guard parts.count == 2,
+          let vid = Int(parts[0], radix: 16),
+          let pid = Int(parts[1], radix: 16) else { return nil }
+    return (vid, pid)
+}
+
+/// Look up the IOKit locationID for a USB device by vendor:product ID.
+func findUSBLocationID(vendorID: Int, productID: Int) -> UInt32? {
+    let matching = IOServiceMatching("IOUSBHostDevice") as NSMutableDictionary
+    matching["idVendor"] = vendorID
+    matching["idProduct"] = productID
+
+    var iterator: io_iterator_t = 0
+    let kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator)
+    guard kr == KERN_SUCCESS else { return nil }
+    defer { IOObjectRelease(iterator) }
+
+    let service = IOIteratorNext(iterator)
+    guard service != 0 else { return nil }
+    defer { IOObjectRelease(service) }
+
+    var props: Unmanaged<CFMutableDictionary>?
+    IORegistryEntryCreateCFProperties(service, &props, kCFAllocatorDefault, 0)
+    guard let dict = props?.takeRetainedValue() as? [String: Any],
+          let locID = dict["locationID"] as? UInt32 else { return nil }
+    return locID
+}
+
+/// Create a _VZIOUSBHostPassthroughDeviceConfiguration via +fromLocationID:error:
+func makeUSBPassthroughConfig(locationID: UInt32) -> NSObject? {
+    guard let cls = NSClassFromString("_VZIOUSBHostPassthroughDeviceConfiguration") else {
+        log("  USB: _VZIOUSBHostPassthroughDeviceConfiguration not available")
+        return nil
+    }
+
+    let sel = NSSelectorFromString("fromLocationID:error:")
+    guard (cls as AnyObject).responds(to: sel) else {
+        log("  USB: fromLocationID:error: not available")
+        return nil
+    }
+
+    var error: NSError?
+    typealias FactoryMethod = @convention(c) (AnyObject, Selector, UInt32, UnsafeMutablePointer<NSError?>) -> AnyObject?
+    let imp = (cls as AnyObject).method(for: sel)
+    let fn = unsafeBitCast(imp, to: FactoryMethod.self)
+    let result = fn(cls as AnyObject, sel, locationID, &error)
+
+    if let error = error {
+        log("  USB: fromLocationID failed: \(error.localizedDescription)")
+        return nil
+    }
+
+    return result as? NSObject
+}
+
+/// Build passthrough device configs for all requested USB devices.
+/// Returns VZUSBDeviceConfiguration objects to add to VZXHCIControllerConfiguration.usbDevices.
+func buildUSBPassthroughConfigs(_ usbIDs: [String]) -> [NSObject] {
+    var configs: [NSObject] = []
+    for usbID in usbIDs {
+        guard let (vid, pid) = parseUSBID(usbID) else {
+            log("  USB: invalid ID '\(usbID)'")
+            continue
+        }
+        guard let locID = findUSBLocationID(vendorID: vid, productID: pid) else {
+            log("  USB: device \(usbID) not found on host")
+            continue
+        }
+        log("  USB: \(usbID) locationID=0x\(String(locID, radix: 16))")
+
+        guard let devConfig = makeUSBPassthroughConfig(locationID: locID) else {
+            continue
+        }
+        configs.append(devConfig)
+    }
+    return configs
+}
+
+// MARK: - Network
+
+/// Build a VZNetworkDeviceAttachment for the given network mode string.
+/// "nat" -> VZNATNetworkDeviceAttachment
+/// "bridge" -> VZBridgedNetworkDeviceAttachment (auto-picks first suitable interface)
+/// "bridge=en0" -> VZBridgedNetworkDeviceAttachment with the named interface
+func makeNetworkAttachment(_ mode: String) -> VZNetworkDeviceAttachment {
+    if mode == "nat" { return VZNATNetworkDeviceAttachment() }
+
+    guard mode.hasPrefix("bridge") else {
+        die("unknown network mode '\(mode)' (expected 'nat' or 'bridge[=<interface>]')")
+    }
+
+    // Parse optional "=<interface>" suffix
+    let requestedIface: String?
+    if let eqIdx = mode.firstIndex(of: "=") {
+        requestedIface = String(mode[mode.index(after: eqIdx)...])
+    } else {
+        requestedIface = nil
+    }
+
+    let interfaces = VZBridgedNetworkInterface.networkInterfaces
+    guard !interfaces.isEmpty else {
+        die("no bridged network interfaces available on this host")
+    }
+
+    let iface: VZBridgedNetworkInterface
+    if let name = requestedIface {
+        guard let found = interfaces.first(where: { $0.identifier == name }) else {
+            let available = interfaces.map { $0.identifier }.joined(separator: ", ")
+            die("bridge interface '\(name)' not found (available: \(available))")
+        }
+        iface = found
+    } else {
+        // Auto-pick: prefer en0, then first available
+        iface = interfaces.first(where: { $0.identifier == "en0" }) ?? interfaces[0]
+    }
+
+    log("  Network: bridge via \(iface.identifier) (\(iface.localizedDisplayName ?? "unknown"))")
+    return VZBridgedNetworkDeviceAttachment(interface: iface)
+}
 
 func buildVMConfig(bundle: VMBundle, config: VMConfig) throws -> VZVirtualMachineConfiguration {
     let vz = VZVirtualMachineConfiguration()
@@ -129,6 +309,7 @@ func buildVMConfig(bundle: VMBundle, config: VMConfig) throws -> VZVirtualMachin
     platform.hardwareModel    = try bundle.loadHardwareModel()
     platform.machineIdentifier = try bundle.loadMachineId()
     platform.auxiliaryStorage  = bundle.loadAuxStorage()
+    if !config.noFairPlay { enableFairPlay(platform) }
     vz.platform   = platform
     vz.bootLoader = VZMacOSBootLoader()
     vz.cpuCount   = config.cpus
@@ -146,10 +327,11 @@ func buildVMConfig(bundle: VMBundle, config: VMConfig) throws -> VZVirtualMachin
         attachment: try VZDiskImageStorageDeviceAttachment(url: bundle.disk, readOnly: false)
     )]
 
-    // Network (NAT)
+    // Network
     let net = VZVirtioNetworkDeviceConfiguration()
     net.macAddress = VZMACAddress(string: config.mac) ?? .randomLocallyAdministered()
-    net.attachment = VZNATNetworkDeviceAttachment()
+    net.attachment = makeNetworkAttachment(config.network)
+    if config.network == "nat" { log("  Network: NAT") }
     vz.networkDevices = [net]
 
     // Input
@@ -177,7 +359,30 @@ func buildVMConfig(bundle: VMBundle, config: VMConfig) throws -> VZVirtualMachin
         }
     }
 
-    try vz.validate()
+    // Private API: Biometric (TouchID) device for attestation
+    if !config.noFairPlay { attachBiometricDevice(vz) }
+
+    // USB Passthrough: add empty XHCI controller.
+    // Device attachment happens at runtime after VM starts (see captureUSBDevices).
+    if !config.usbDevices.isEmpty {
+        vz.usbControllers = [VZXHCIControllerConfiguration()]
+        log("  USB: XHCI controller added")
+    }
+
+    do {
+        try vz.validate()
+    } catch {
+        let ns = error as NSError
+        log("Validation failed: \(ns.localizedDescription)")
+        if let reason = ns.userInfo[NSLocalizedFailureReasonErrorKey] as? String {
+            log("  Reason: \(reason)")
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            log("  Underlying: \(underlying.domain) \(underlying.code) - \(underlying.localizedDescription)")
+        }
+        throw error
+    }
+
     return vz
 }
 
@@ -190,6 +395,7 @@ func buildInstallVMConfig(hardwareModel: VZMacHardwareModel, machineId: VZMacMac
     platform.hardwareModel     = hardwareModel
     platform.machineIdentifier = machineId
     platform.auxiliaryStorage  = auxStorage
+    if !config.noFairPlay { enableFairPlay(platform) }
     vz.platform   = platform
     vz.bootLoader = VZMacOSBootLoader()
     vz.cpuCount   = config.cpus
@@ -207,7 +413,7 @@ func buildInstallVMConfig(hardwareModel: VZMacHardwareModel, machineId: VZMacMac
 
     let net = VZVirtioNetworkDeviceConfiguration()
     net.macAddress = VZMACAddress(string: config.mac) ?? .randomLocallyAdministered()
-    net.attachment = VZNATNetworkDeviceAttachment()
+    net.attachment = makeNetworkAttachment(config.network)
     vz.networkDevices = [net]
 
     vz.keyboards       = [VZUSBKeyboardConfiguration()]
@@ -398,11 +604,103 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             log("Starting...")
             if recovery {
                 let opts = VZMacOSVirtualMachineStartOptions(); opts.startUpFromMacOSRecovery = true
-                vm.start(options: opts) { if let e = $0 { die("Failed to start: \(e.localizedDescription)") }; log("VM running (recovery).") }
+                vm.start(options: opts) { [self] err in
+                    if let e = err { die("Failed to start: \(e.localizedDescription)") }
+                    log("VM running (recovery).")
+                    self.captureUSBDevices(from: vm)
+                }
             } else {
-                vm.start { r in if case .failure(let e) = r { die("Failed to start: \(e.localizedDescription)") }; log("VM running.") }
+                vm.start { [self] r in
+                    if case .failure(let e) = r { die("Failed to start: \(e.localizedDescription)") }
+                    log("VM running.")
+                    self.captureUSBDevices(from: vm)
+                }
             }
         } catch { die(error.localizedDescription) }
+    }
+
+    func captureUSBDevices(from vm: VZVirtualMachine) {
+        guard !config.usbDevices.isEmpty else { return }
+        guard let controller = vm.usbControllers.first else {
+            log("  USB: no XHCI controller on running VM")
+            return
+        }
+
+        // Build passthrough configs and create runtime devices, then attach + capture.
+        let usbConfigs = buildUSBPassthroughConfigs(config.usbDevices)
+        guard !usbConfigs.isEmpty else {
+            log("  USB: no valid passthrough configs")
+            return
+        }
+
+        // Create runtime _VZIOUSBHostPassthroughDevice from each config
+        guard let devCls = NSClassFromString("_VZIOUSBHostPassthroughDevice") as? NSObject.Type else {
+            log("  USB: _VZIOUSBHostPassthroughDevice not available")
+            return
+        }
+
+        let initSel = NSSelectorFromString("initWithConfiguration:error:")
+        guard devCls.instancesRespond(to: initSel) else {
+            log("  USB: initWithConfiguration:error: not available")
+            return
+        }
+
+        typealias InitMethod = @convention(c) (AnyObject, Selector, AnyObject, UnsafeMutablePointer<NSError?>) -> AnyObject?
+        let initImp = devCls.instanceMethod(for: initSel)!
+        let initFn = unsafeBitCast(initImp, to: InitMethod.self)
+
+        var devices: [NSObject] = []
+        for cfg in usbConfigs {
+            let obj = devCls.init()
+            var err: NSError?
+            if let dev = initFn(obj, initSel, cfg, &err) as? NSObject {
+                devices.append(dev)
+                log("  USB: device created from config")
+            } else {
+                log("  USB: device init failed: \(err?.localizedDescription ?? "unknown")")
+            }
+        }
+
+        guard !devices.isEmpty else {
+            log("  USB: no runtime devices created")
+            return
+        }
+
+        // Attach each device to the XHCI controller, then capture
+        let group = DispatchGroup()
+        for dev in devices {
+            group.enter()
+            controller.attach(device: dev as! VZUSBDevice) { error in
+                if let e = error {
+                    log("  USB: attach failed: \(e.localizedDescription)")
+                } else {
+                    log("  USB: device attached")
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) {
+            // After all devices attached, capture passthrough devices from host
+            let captureSel = NSSelectorFromString("_capturePassthroughDevicesWithCompletionHandler:")
+            guard (controller as NSObject).responds(to: captureSel) else {
+                log("  USB: _capturePassthroughDevices not available")
+                return
+            }
+
+            // Note: type encoding shows ^v (raw pointer) for the handler parameter,
+            // but ObjC runtime accepts blocks as void* transparently.
+            typealias CaptureMethod = @convention(c) (AnyObject, Selector, @escaping @convention(block) (NSError?) -> Void) -> Void
+            let imp = (controller as NSObject).method(for: captureSel)
+            let fn = unsafeBitCast(imp, to: CaptureMethod.self)
+            fn(controller, captureSel) { error in
+                if let e = error {
+                    log("  USB: capture failed: \(e.localizedDescription)")
+                } else {
+                    log("  USB: passthrough devices captured from host")
+                }
+            }
+        }
     }
 }
 
@@ -420,12 +718,16 @@ OPTIONS:
   --cpus <n>       CPU count (default: 4)      --memory <n>     RAM in GB (default: 4)
   --disk <n>       Disk size in GB (default: 64, install only)
   --display <WxH>  Resolution (default: 1920x1200)
+  --net <mode>     Network: nat (default), bridge, bridge=<iface>
   --no-accel       Disable VideoToolbox/M2Scaler paravirtualization
   --no-audio       Disable audio
+  --no-fairplay    Disable FairPlay DRM paravirtualization
+  --usb <vid:pid>  Pass through USB device (hex, e.g. 05ac:12ab). Repeatable.
 
 EXAMPLES:
   avm install latest ~/VMs/dev.vbvm --cpus 6 --memory 8 --disk 128
-  avm ~/VMs/dev.vbvm
+  avm ~/VMs/dev.vbvm --net bridge
+  avm ~/VMs/dev.vbvm --net bridge=en0
   avm --headless --recovery ~/VMs/dev.vbvm
 """
 
@@ -446,6 +748,9 @@ while i < args.count {
     case "--recovery":  recovery = true
     case "--no-accel":  config.noAccel = true
     case "--no-audio":  config.noAudio = true
+    case "--no-fairplay": config.noFairPlay = true
+    case "--net":       i += 1; guard i < args.count else { die("--net needs mode (nat, bridge, bridge=<iface>)") }; config.network = args[i]
+    case "--usb":       i += 1; guard i < args.count else { die("--usb needs vid:pid") }; config.usbDevices.append(args[i])
     case "--cpus":      i += 1; guard i < args.count, let v = Int(args[i]), v > 0 else { die("--cpus needs positive int") }; config.cpus = v
     case "--memory":    i += 1; guard i < args.count, let v = Int(args[i]), v > 0 else { die("--memory needs positive int") }; config.memoryGB = v
     case "--disk":      i += 1; guard i < args.count, let v = Int(args[i]), v > 0 else { die("--disk needs positive int") }; config.diskGB = v
@@ -479,6 +784,9 @@ if isInstall {
     if args.contains("--display") { cfg.width  = config.width; cfg.height = config.height }
     if args.contains("--no-audio") { cfg.noAudio = true }
     if args.contains("--no-accel") { cfg.noAccel = true }
+    if args.contains("--no-fairplay") { cfg.noFairPlay = true }
+    if args.contains("--net") { cfg.network = config.network }
+    if !config.usbDevices.isEmpty { cfg.usbDevices = config.usbDevices }
 
     let app = NSApplication.shared
     let appDelegate = AppDelegate(bundle: bundle, config: cfg, headless: headless, recovery: recovery)

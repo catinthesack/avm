@@ -10,5 +10,15 @@
 	<true/>
 	<key>com.apple.virtualization.avp.AppleM2ScalerDevice</key>
 	<true/>
+	<key>com.apple.virtualization.avp.fairplay-device</key>
+	<true/>
+	<key>com.apple.virtualization.avp.biometric-device</key>
+	<true/>
+	<key>com.apple.virtualization.avp.usb-device-controller</key>
+	<true/>
+	<key>com.apple.vm.device-access</key>
+	<true/>
+	<key>com.apple.vm.networking</key>
+	<true/>
 </dict>
 </plist>
